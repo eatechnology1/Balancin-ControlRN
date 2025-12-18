@@ -1,0 +1,163 @@
+<<<<<<< HEAD
+#include <Arduino.h>
+#include "Neural_Networks_FF.h"
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+
+#define LED 2
+
+
+// Variables de tiempo
+unsigned long previousMillis = 0;  // Tiempo anterior
+unsigned long escUpdateMillis = 0;  // Tiempo anterior para cambiar ESC
+const unsigned long interval = 10;  // Intervalo de 10 ms para las lecturas del potenciómetro
+int potReading;
+char buffer[500];
+
+
+
+void setup() {
+  // Iniciar el monitor serie para depuración
+  Serial.begin(115200);
+
+  // Configurar el Timer para que dispare una interrupción cada 10 ms (100 Hz)
+  timer = timerBegin(0, 80, true);  // Timer 0, prescaler de 80 para tener ticks de 1 microsegundo
+  timerAttachInterrupt(timer, &onTimer, true);  // Adjuntar la función de interrupción
+  timerAlarmWrite(timer, 10000, true);  // Interrupción cada 10,000 microsegundos (10 ms)
+  timerAlarmEnable(timer);  // Habilitar el temporizador
+
+  // Asignar el pin para el ESC
+  esc.attach(escPin, 1000, 2000);  // Rango típico de un ESC (1000-2000 microsegundos)
+
+  // Iniciar el ESC con el valor mínimo (motor apagado)
+  esc.writeMicroseconds(escValue);  // 1000 µs es el valor mínimo (motor apagado)
+  delay(5000);  // Esperar 2 segundos para que el ESC se inicialice
+
+  randomSeed(analogRead(0));
+  delay(300);
+  
+  
+}
+void loop() {
+  unsigned long currentMillis = millis();  // Obtener el tiempo actual
+
+  // Leer el valor del potenciómetro y actualizar la salida serial cada 10 ms
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Bloquear acceso a la variable compartida para evitar condiciones de carrera
+    
+    portENTER_CRITICAL(&timerMux);
+    potReading = potValue;
+    portEXIT_CRITICAL(&timerMux);
+    }
+
+    if (Serial.available()){
+    str = Serial.readStringUntil('\n');
+    setPoint= str.substring(0,4).toFloat();
+    }
+
+   // Aplicar el nuevo valor del ESC
+      Output=Output*100;
+      int mapeo = map(Output, 0, 100, 1330, 1375);
+
+      esc.writeMicroseconds(mapeo);
+      Serial.print("  ");
+      Serial.print(setPoint);
+      Serial.print("  ");
+      Serial.print(potReading);
+      Serial.print("  ");
+      Serial.print(error);
+      Serial.print("  ");
+      Serial.print(Output);
+      Serial.print("  ");
+      Serial.println(mapeo);
+      
+    delay(50);
+    
+}
+
+=======
+#include <Arduino.h>
+#include "Neural_Networks_FF.h"
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+
+#define LED 2
+
+
+// Variables de tiempo
+unsigned long previousMillis = 0;  // Tiempo anterior
+unsigned long escUpdateMillis = 0;  // Tiempo anterior para cambiar ESC
+const unsigned long interval = 10;  // Intervalo de 10 ms para las lecturas del potenciómetro
+int potReading;
+char buffer[500];
+
+
+
+void setup() {
+  // Iniciar el monitor serie para depuración
+  Serial.begin(115200);
+
+  // Configurar el Timer para que dispare una interrupción cada 10 ms (100 Hz)
+  timer = timerBegin(0, 80, true);  // Timer 0, prescaler de 80 para tener ticks de 1 microsegundo
+  timerAttachInterrupt(timer, &onTimer, true);  // Adjuntar la función de interrupción
+  timerAlarmWrite(timer, 10000, true);  // Interrupción cada 10,000 microsegundos (10 ms)
+  timerAlarmEnable(timer);  // Habilitar el temporizador
+
+  // Asignar el pin para el ESC
+  esc.attach(escPin, 1000, 2000);  // Rango típico de un ESC (1000-2000 microsegundos)
+
+  // Iniciar el ESC con el valor mínimo (motor apagado)
+  esc.writeMicroseconds(escValue);  // 1000 µs es el valor mínimo (motor apagado)
+  delay(5000);  // Esperar 2 segundos para que el ESC se inicialice
+
+  randomSeed(analogRead(0));
+  delay(300);
+  
+  
+}
+void loop() {
+  unsigned long currentMillis = millis();  // Obtener el tiempo actual
+
+  // Leer el valor del potenciómetro y actualizar la salida serial cada 10 ms
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Bloquear acceso a la variable compartida para evitar condiciones de carrera
+    
+    portENTER_CRITICAL(&timerMux);
+    potReading = potValue;
+    portEXIT_CRITICAL(&timerMux);
+    }
+
+    if (Serial.available()){
+    str = Serial.readStringUntil('\n');
+    setPoint= str.substring(0,4).toFloat();
+    }
+
+   // Aplicar el nuevo valor del ESC
+      Output=Output*100;
+      int mapeo = map(Output, 0, 100, 1330, 1375);
+
+      esc.writeMicroseconds(mapeo);
+      Serial.print("  ");
+      Serial.print(setPoint);
+      Serial.print("  ");
+      Serial.print(potReading);
+      Serial.print("  ");
+      Serial.print(error);
+      Serial.print("  ");
+      Serial.print(Output);
+      Serial.print("  ");
+      Serial.println(mapeo);
+      
+    delay(50);
+    
+}
+
+>>>>>>> ec42d93 (Inicial all)

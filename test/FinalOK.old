@@ -1,0 +1,577 @@
+<<<<<<< HEAD
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+
+// ===================== PINES MOTORES ==========================
+#define AIN1 7
+#define AIN2 6
+#define PWMA 5
+#define BIN1 16
+#define BIN2 17
+#define PWMB 18
+#define STBY 15
+
+// ===================== PWM ====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+const ledc_channel_t CH_A = LEDC_CHANNEL_0;
+const ledc_channel_t CH_B = LEDC_CHANNEL_1;
+
+// ===================== PINES ENCODERS ==========================
+#define R_A 3
+#define R_B 46
+#define L_A 9
+#define L_B 11
+
+volatile long countR = 0;
+volatile long countL = 0;
+
+const int CPR = 44;   // JGA25-370 → 11 PPR × 4 = 44 pulsos por vuelta
+
+// ===================== MPU ====================================
+MPU6050 mpu;
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+float gx_offset = 0;
+
+// ===================== FILTRO =================================
+float angleFiltered = 0;
+unsigned long lastTime = 0;
+
+// ===================== CONTROL EN CASCADA ======================
+// PID ÁNGULO
+float setpoint_angle = 0.0;
+float Kp_angle = 80;
+float Ki_angle = 1.1;
+float Kd_angle = 1.6;
+
+float angle_integral = 0;
+float angle_prev_error = 0;
+
+// PI VELOCIDAD
+float Kp_speed = 0.8;
+float Ki_speed = 0.0005;
+
+float speed_integral = 0;
+
+float MAX_ANGLE = 45;
+float PWM_LIMIT = 255;
+
+// ===================== ISRs ENCODER ============================
+void IRAM_ATTR isr_RA() {
+  if (digitalRead(R_A) == digitalRead(R_B)) countR++;
+  else countR--;
+}
+
+void IRAM_ATTR isr_LA() {
+  if (digitalRead(L_A) == digitalRead(L_B)) countL++;
+  else countL--;
+}
+
+// ===================== PWM MOTOR ===============================
+void setupMotorPWM(int pwmPin, int pwmChannel, int timerNum) {
+  ledc_timer_config_t timer_conf = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = (ledc_timer_t)timerNum,
+      .freq_hz = PWM_FREQ,
+      .clk_cfg = LEDC_AUTO_CLK };
+
+  ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t channel_conf = {
+      .gpio_num = pwmPin,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = (ledc_channel_t)pwmChannel,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = (ledc_timer_t)timerNum,
+      .duty = 0 };
+
+  ledc_channel_config(&channel_conf);
+}
+
+void driveMotors(float pwm) {
+  int duty = constrain(abs(pwm), 0, 255);
+
+  if (pwm > 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  } else {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  }
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_A, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_A);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_B, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_B);
+}
+
+
+// ===================== CONTROL EN CASCADA ======================
+float cascada(float angle, float rpmLeft, float rpmRight, float dt)
+{
+  // PID ÁNGULO
+  float error = setpoint_angle - angle;
+  float derivative = (error - angle_prev_error) / dt;
+
+  float pid_unsat =
+      Kp_angle * error +
+      Ki_angle * angle_integral +
+      Kd_angle * derivative;
+
+  float speed_ref = constrain(pid_unsat, -300, 300);
+  bool saturated_angle = (pid_unsat != speed_ref);
+
+  if (!saturated_angle || (error * pid_unsat) < 0) {
+    angle_integral += error * dt;
+  }
+
+  angle_prev_error = error;
+
+  // PI VELOCIDAD
+  float speed_measured = (rpmLeft + rpmRight) * 0.5;
+  float error_speed = speed_ref - speed_measured;
+
+  float pwm_unsat =
+      Kp_speed * error_speed +
+      Ki_speed * speed_integral;
+
+  float pwm = constrain(pwm_unsat, -PWM_LIMIT, PWM_LIMIT);
+  bool saturated_speed = (pwm_unsat != pwm);
+
+  if (!saturated_speed || (error_speed * pwm_unsat) < 0) {
+    speed_integral += error_speed * dt;
+  }
+
+  speed_integral = constrain(speed_integral, -150, 150);
+
+  if (abs(angle) > MAX_ANGLE) return 0;
+
+  return pwm;
+}
+
+
+// ====================================================================
+//                     🔥  TAREA DE BALANCEO EN CORE 1
+// ====================================================================
+void TaskBalanceo(void *pvParameters)
+{
+  const TickType_t dt_task = pdMS_TO_TICKS(20); // 20ms = 50Hz igual a tu SAMPLE_MS
+
+  while (true)
+  {
+    unsigned long now = millis();
+    float dt = 0.020; // 20 ms fijo → evita jitter
+
+    // ---- MPU ----
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float accelY = (ay - ay_offset) / 16384.0;
+    float accelZ = (az - az_offset) / 16384.0;
+    float gyroX = (gx - gx_offset) / 131.0;
+
+    float angleAcc = atan2(accelY, accelZ) * 180.0 / PI;
+    angleFiltered = 0.98 * (angleFiltered + gyroX * dt) + 0.02 * angleAcc;
+
+    // ---- ENCODERS → RPM ----
+    long pulsesR = countR;
+    long pulsesL = countL;
+    countR = 0;
+    countL = 0;
+
+    const float PPR = 44.0 * 119.0;
+    float revR = pulsesR / PPR;
+    float revL = pulsesL / PPR;
+
+    float rpmR = (revR / dt) * 60.0;
+    float rpmL = (revL / dt) * 60.0;
+
+    static float rpmR_f = 0, rpmL_f = 0;
+    rpmR_f = 0.7 * rpmR_f + 0.3 * rpmR;
+    rpmL_f = 0.7 * rpmL_f + 0.3 * rpmL;
+
+    // ---- CONTROL ----
+    float pwm = cascada(angleFiltered, rpmL_f, rpmR_f, dt);
+    driveMotors(pwm);
+
+    // Debug
+    Serial.print("Ang: "); Serial.print(angleFiltered);
+    Serial.print(" | rpmL: "); Serial.print(rpmL_f);
+    Serial.print(" | rpmR: "); Serial.print(rpmR_f);
+    Serial.print(" | PWM: "); Serial.println(pwm);
+
+    vTaskDelay(dt_task);
+  }
+}
+
+
+// ====================================================================
+//                                  SETUP
+// ====================================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(41, 42);
+  mpu.initialize();
+
+  // Motores
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  setupMotorPWM(PWMA, CH_A, 0);
+  setupMotorPWM(PWMB, CH_B, 1);
+
+  // Encoders
+  pinMode(R_A, INPUT_PULLUP);
+  pinMode(R_B, INPUT_PULLUP);
+  pinMode(L_A, INPUT_PULLUP);
+  pinMode(L_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(R_A), isr_RA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(L_A), isr_LA, CHANGE);
+
+  // Calibración MPU
+  long ax_sum = 0, ay_sum = 0, az_sum = 0, gx_sum = 0;
+  const int samples = 500;
+
+  for (int i = 0; i < samples; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    gx_sum += gx;
+    delay(3);
+  }
+
+  ax_offset = ax_sum / samples;
+  ay_offset = ay_sum / samples;
+  az_offset = (az_sum / samples) - 16384;
+  gx_offset = gx_sum / samples;
+
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  angleFiltered = atan2((ay - ay_offset)/16384.0, (az - az_offset)/16384.0) * 180.0 / PI;
+
+  // -------------------------
+  // 🔥 Crear la tarea en Core 1
+  // -------------------------
+  xTaskCreatePinnedToCore(
+      TaskBalanceo,       // función
+      "TaskBalanceo",     // nombre
+      10000,              // stack
+      NULL,
+      3,                  // prioridad ALTA
+      NULL,
+      1                   // CORE 1 → núcleo fuerte
+  );
+
+  Serial.println("Balanceo corriendo en Core 1.");
+}
+
+
+// ====================================================================
+//                               LOOP VACÍO
+// ====================================================================
+void loop() {
+  // Core 0 libre (aquí pondremos el seguidor de línea luego)
+}
+=======
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+
+// ===================== PINES MOTORES ==========================
+#define AIN1 7
+#define AIN2 6
+#define PWMA 5
+#define BIN1 16
+#define BIN2 17
+#define PWMB 18
+#define STBY 15
+
+// ===================== PWM ====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+const ledc_channel_t CH_A = LEDC_CHANNEL_0;
+const ledc_channel_t CH_B = LEDC_CHANNEL_1;
+
+// ===================== PINES ENCODERS ==========================
+#define R_A 3
+#define R_B 46
+#define L_A 9
+#define L_B 11
+
+volatile long countR = 0;
+volatile long countL = 0;
+
+const int CPR = 44;   // JGA25-370 → 11 PPR × 4 = 44 pulsos por vuelta
+
+// ===================== MPU ====================================
+MPU6050 mpu;
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+float gx_offset = 0;
+
+// ===================== FILTRO =================================
+float angleFiltered = 0;
+unsigned long lastTime = 0;
+
+// ===================== CONTROL EN CASCADA ======================
+// PID ÁNGULO
+float setpoint_angle = 0.0;
+float Kp_angle = 80;
+float Ki_angle = 1.1;
+float Kd_angle = 1.6;
+
+float angle_integral = 0;
+float angle_prev_error = 0;
+
+// PI VELOCIDAD
+float Kp_speed = 0.8;
+float Ki_speed = 0.0005;
+
+float speed_integral = 0;
+
+float MAX_ANGLE = 45;
+float PWM_LIMIT = 255;
+
+// ===================== ISRs ENCODER ============================
+void IRAM_ATTR isr_RA() {
+  if (digitalRead(R_A) == digitalRead(R_B)) countR++;
+  else countR--;
+}
+
+void IRAM_ATTR isr_LA() {
+  if (digitalRead(L_A) == digitalRead(L_B)) countL++;
+  else countL--;
+}
+
+// ===================== PWM MOTOR ===============================
+void setupMotorPWM(int pwmPin, int pwmChannel, int timerNum) {
+  ledc_timer_config_t timer_conf = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = (ledc_timer_t)timerNum,
+      .freq_hz = PWM_FREQ,
+      .clk_cfg = LEDC_AUTO_CLK };
+
+  ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t channel_conf = {
+      .gpio_num = pwmPin,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = (ledc_channel_t)pwmChannel,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = (ledc_timer_t)timerNum,
+      .duty = 0 };
+
+  ledc_channel_config(&channel_conf);
+}
+
+void driveMotors(float pwm) {
+  int duty = constrain(abs(pwm), 0, 255);
+
+  if (pwm > 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  } else {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  }
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_A, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_A);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_B, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_B);
+}
+
+
+// ===================== CONTROL EN CASCADA ======================
+float cascada(float angle, float rpmLeft, float rpmRight, float dt)
+{
+  // PID ÁNGULO
+  float error = setpoint_angle - angle;
+  float derivative = (error - angle_prev_error) / dt;
+
+  float pid_unsat =
+      Kp_angle * error +
+      Ki_angle * angle_integral +
+      Kd_angle * derivative;
+
+  float speed_ref = constrain(pid_unsat, -300, 300);
+  bool saturated_angle = (pid_unsat != speed_ref);
+
+  if (!saturated_angle || (error * pid_unsat) < 0) {
+    angle_integral += error * dt;
+  }
+
+  angle_prev_error = error;
+
+  // PI VELOCIDAD
+  float speed_measured = (rpmLeft + rpmRight) * 0.5;
+  float error_speed = speed_ref - speed_measured;
+
+  float pwm_unsat =
+      Kp_speed * error_speed +
+      Ki_speed * speed_integral;
+
+  float pwm = constrain(pwm_unsat, -PWM_LIMIT, PWM_LIMIT);
+  bool saturated_speed = (pwm_unsat != pwm);
+
+  if (!saturated_speed || (error_speed * pwm_unsat) < 0) {
+    speed_integral += error_speed * dt;
+  }
+
+  speed_integral = constrain(speed_integral, -150, 150);
+
+  if (abs(angle) > MAX_ANGLE) return 0;
+
+  return pwm;
+}
+
+
+// ====================================================================
+//                     🔥  TAREA DE BALANCEO EN CORE 1
+// ====================================================================
+void TaskBalanceo(void *pvParameters)
+{
+  const TickType_t dt_task = pdMS_TO_TICKS(20); // 20ms = 50Hz igual a tu SAMPLE_MS
+
+  while (true)
+  {
+    unsigned long now = millis();
+    float dt = 0.020; // 20 ms fijo → evita jitter
+
+    // ---- MPU ----
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float accelY = (ay - ay_offset) / 16384.0;
+    float accelZ = (az - az_offset) / 16384.0;
+    float gyroX = (gx - gx_offset) / 131.0;
+
+    float angleAcc = atan2(accelY, accelZ) * 180.0 / PI;
+    angleFiltered = 0.98 * (angleFiltered + gyroX * dt) + 0.02 * angleAcc;
+
+    // ---- ENCODERS → RPM ----
+    long pulsesR = countR;
+    long pulsesL = countL;
+    countR = 0;
+    countL = 0;
+
+    const float PPR = 44.0 * 119.0;
+    float revR = pulsesR / PPR;
+    float revL = pulsesL / PPR;
+
+    float rpmR = (revR / dt) * 60.0;
+    float rpmL = (revL / dt) * 60.0;
+
+    static float rpmR_f = 0, rpmL_f = 0;
+    rpmR_f = 0.7 * rpmR_f + 0.3 * rpmR;
+    rpmL_f = 0.7 * rpmL_f + 0.3 * rpmL;
+
+    // ---- CONTROL ----
+    float pwm = cascada(angleFiltered, rpmL_f, rpmR_f, dt);
+    driveMotors(pwm);
+
+    // Debug
+    Serial.print("Ang: "); Serial.print(angleFiltered);
+    Serial.print(" | rpmL: "); Serial.print(rpmL_f);
+    Serial.print(" | rpmR: "); Serial.print(rpmR_f);
+    Serial.print(" | PWM: "); Serial.println(pwm);
+
+    vTaskDelay(dt_task);
+  }
+}
+
+
+// ====================================================================
+//                                  SETUP
+// ====================================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(41, 42);
+  mpu.initialize();
+
+  // Motores
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  setupMotorPWM(PWMA, CH_A, 0);
+  setupMotorPWM(PWMB, CH_B, 1);
+
+  // Encoders
+  pinMode(R_A, INPUT_PULLUP);
+  pinMode(R_B, INPUT_PULLUP);
+  pinMode(L_A, INPUT_PULLUP);
+  pinMode(L_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(R_A), isr_RA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(L_A), isr_LA, CHANGE);
+
+  // Calibración MPU
+  long ax_sum = 0, ay_sum = 0, az_sum = 0, gx_sum = 0;
+  const int samples = 500;
+
+  for (int i = 0; i < samples; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    gx_sum += gx;
+    delay(3);
+  }
+
+  ax_offset = ax_sum / samples;
+  ay_offset = ay_sum / samples;
+  az_offset = (az_sum / samples) - 16384;
+  gx_offset = gx_sum / samples;
+
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax, &ay, &az);
+  angleFiltered = atan2((ay - ay_offset)/16384.0, (az - az_offset)/16384.0) * 180.0 / PI;
+
+  // -------------------------
+  // 🔥 Crear la tarea en Core 1
+  // -------------------------
+  xTaskCreatePinnedToCore(
+      TaskBalanceo,       // función
+      "TaskBalanceo",     // nombre
+      10000,              // stack
+      NULL,
+      3,                  // prioridad ALTA
+      NULL,
+      1                   // CORE 1 → núcleo fuerte
+  );
+
+  Serial.println("Balanceo corriendo en Core 1.");
+}
+
+
+// ====================================================================
+//                               LOOP VACÍO
+// ====================================================================
+void loop() {
+  // Core 0 libre (aquí pondremos el seguidor de línea luego)
+}
+>>>>>>> ec42d93 (Inicial all)

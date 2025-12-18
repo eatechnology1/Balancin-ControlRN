@@ -1,0 +1,1435 @@
+<<<<<<< HEAD
+
+
+/* CascadaPrueba_LQR_Web.ino
+   LQR state-feedback controller (práctico) para ESP32-S3
+   Conserva PID para seguidor de línea.
+   Añadido: servidor web + WebSocket para telemetría.
+   Autor: Adaptado y optimizado (para tu base)
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+#include <PID_v1.h>
+
+// Web & Async
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// ----------------------- CONFIG WIFI --------------------------
+const char *WIFI_SSID = "Calderon Ramon"; // <-- sustituye
+const char *WIFI_PASS = "Lina.Alex.321";  // <-- sustituye
+
+// ---------- WEBSERVER / WEBSOCKET ----------
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+const int WS_SEND_PERIOD_MS = 50; // intervalo de envío WS (ms) -> 20 Hz
+
+// ----------------------- HARDWARE PINS -------------------------
+#define AIN1 7
+#define AIN2 6
+#define PWMA 5
+#define BIN1 16
+#define BIN2 17
+#define PWMB 18
+#define STBY 15
+
+// ENCODERS
+#define R_A 3
+#define R_B 46
+#define L_A 9
+#define L_B 11
+
+// SENSORES LINEA (mantener como en tu diseño)
+#define NUM_SENSORS 8
+const uint8_t sensorPins[NUM_SENSORS] = {40, 38, 37, 36, 35, 0, 45, 48};
+
+// ----------------------- PWM / LEDC ---------------------------
+#define PWM_FREQ 20000
+#define PWM_RES 8
+const ledc_channel_t CH_A = LEDC_CHANNEL_0;
+const ledc_channel_t CH_B = LEDC_CHANNEL_1;
+
+// ----------------------- IMU / ENCODERS -----------------------
+MPU6050 mpu;
+volatile long countR = 0;
+volatile long countL = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // para acceso crítico
+
+// Ajusta según tu reductor / encoder (pulses per revolution)
+const float PPR = 44.0f * 119.0f;
+
+// Parámetros físicos (ajusta wheel radius si quieres velocidad en m/s)
+const float WHEEL_RADIUS = 0.03f; // m (ejemplo 3 cm). AJUSTAR.
+const float WHEEL_BASE = 0.12f;   // distancia entre ruedas en m (opcional).
+
+// ----------------------- ESTADO / OFFSET IMU ------------------
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+float gx_offset = 0;
+float angleFiltered = 0.0f; // rad
+
+// ----------------------- LQR (ganancias) ----------------------
+// Estado x = [ theta (rad), theta_dot (rad/s), v (m/s) ]
+// Control u = -K * x  -> u es señal base para motores (PWM target, sign handled)
+float K_LQR[3] = {150.0f, 8.0f, 20.0f}; // valores iniciales SUGERIDOS — TUNEAR
+
+// Saturaciones
+const float PWM_LIMIT = 255.0f;
+const float MAX_ANGLE_DEG = 40.0f;
+
+// ----------------------- PID LINEA ----------------------------
+volatile float factor_giro = 0.0f;
+double lineInput = 0, lineOutput = 0, lineSetpoint = 350.0;
+double Kp_line = 40.0, Ki_line = 0.0, Kd_line = 12.0;
+PID pidLinea(&lineInput, &lineOutput, &lineSetpoint, Kp_line, Ki_line, Kd_line, DIRECT);
+
+// ----------------------- TELEMETRÍA (variables para web) ------
+float last_u = 0.0f;
+float last_v = 0.0f;
+float last_theta_dot = 0.0f;
+
+// ----------------------- ISRs ENCODER -------------------------
+void IRAM_ATTR isr_RA()
+{
+  if (digitalRead(R_A) == digitalRead(R_B))
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countR++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+  else
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countR--;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+void IRAM_ATTR isr_LA()
+{
+  if (digitalRead(L_A) == digitalRead(L_B))
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countL++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+  else
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countL--;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+// ----------------------- PWM setup & drive ---------------------
+void setupMotorPWM(int pwmPin, int pwmChannel, int timerNum)
+{
+  ledc_timer_config_t timer_conf = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = (ledc_timer_t)timerNum,
+      .freq_hz = PWM_FREQ,
+      .clk_cfg = LEDC_AUTO_CLK};
+  ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t channel_conf = {
+      .gpio_num = pwmPin,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = (ledc_channel_t)pwmChannel,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = (ledc_timer_t)timerNum,
+      .duty = 0};
+  ledc_channel_config(&channel_conf);
+}
+
+// aplica pwm diferencial. pwmL/pwmR en rango [-255,255]
+void driveMotorsDifferential(float pwmL, float pwmR)
+{
+  digitalWrite(STBY, HIGH);
+
+  int dutyL = constrain((int)fabs(pwmL), 0, 255);
+  int dutyR = constrain((int)fabs(pwmR), 0, 255);
+
+  if (pwmL >= 0)
+  {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  }
+  else
+  {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  }
+
+  if (pwmR >= 0)
+  {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  }
+  else
+  {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  }
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_A, dutyL);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_A);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_B, dutyR);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_B);
+}
+
+// ----------------------- UTILIDADES ---------------------------
+static inline float rpm_to_mps(float rpm)
+{
+  // rpm -> revoluciones/s -> m/s
+  float rps = rpm / 60.0f;
+  return rps * (2.0f * PI * WHEEL_RADIUS);
+}
+
+// convierte grados a rad
+static inline float deg2rad(float d) { return d * (PI / 180.0f); }
+static inline float rad2deg(float r) { return r * (180.0f / PI); }
+
+// lectura atómica de contadores
+void readAndClearEncoders(long &r, long &l)
+{
+  portENTER_CRITICAL(&mux);
+  r = countR;
+  l = countL;
+  countR = 0;
+  countL = 0;
+  portEXIT_CRITICAL(&mux);
+}
+
+// ----------------------- CONTROL LQR --------------------------
+// devuelve u = -K*x  (u en "unidades PWM").
+// x: theta(rad), theta_dot(rad/s), v(m/s)
+float lqr_control(float theta, float theta_dot, float v)
+{
+  // vector multiply
+  float u = -(K_LQR[0] * theta + K_LQR[1] * theta_dot + K_LQR[2] * v);
+  // opcional: anti-wind, smooth, o feedforward puede añadirse aquí
+  return u;
+}
+
+// ----------------------- WEBSOCKET HANDLER --------------------
+void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+  if (type == WS_EVT_CONNECT)
+  {
+    Serial.printf("WS client %u connected\n", client->id());
+  }
+  else if (type == WS_EVT_DISCONNECT)
+  {
+    Serial.printf("WS client %u disconnected\n", client->id());
+  }
+  else if (type == WS_EVT_DATA)
+  {
+    // Procesar mensajes entrantes si lo deseas (por ejemplo comandos)
+    // Actualmente no usamos mensajes entrantes.
+  }
+}
+
+// ----------------------- TASK BALANCEO (Core 1) ---------------
+void TaskBalanceo(void *pvParameters)
+{
+  const TickType_t period = pdMS_TO_TICKS(20); // 50 Hz
+  TickType_t lastWake = xTaskGetTickCount();
+
+  unsigned long lastWs = 0;
+
+  while (true)
+  {
+    vTaskDelayUntil(&lastWake, period);
+
+    // --- leer encoders atómicamente ---
+    long pulsesR = 0, pulsesL = 0;
+    readAndClearEncoders(pulsesR, pulsesL);
+
+    // calcular RPM (pulses -> rev -> rpm)
+    float revR = pulsesR / PPR;
+    float revL = pulsesL / PPR;
+    float rpmR = (revR / 0.02f) * 60.0f; // periodo 20 ms
+    float rpmL = (revL / 0.02f) * 60.0f;
+
+    // velocidad lineal (m/s) - promedio ruedas
+    float vR = rpm_to_mps(rpmR);
+    float vL = rpm_to_mps(rpmL);
+    float v = 0.5f * (vR + vL);
+
+    // --- IMU ---
+    int16_t ax_i, ay_i, az_i, gx_i, gy_i, gz_i;
+    mpu.getMotion6(&ax_i, &ay_i, &az_i, &gx_i, &gy_i, &gz_i);
+
+    float ay = (float)ay_i - ay_offset;
+    float az = (float)az_i - az_offset;
+    float gx = ((float)gx_i - gx_offset) / 131.0f; // deg/s
+    // convertir a rad/s
+    float gx_rad = deg2rad(gx);
+
+    // complementary filter: angle in radians
+    float accelAngle = atan2f(ay, az); // rad
+    // estimación de vel ang = gx_rad
+    static float theta = 0.0f;
+    static float theta_dot = 0.0f;
+
+    // calcular theta_dot a partir de gyro (más robusto) y filtro
+    theta_dot = gx_rad;
+    // actualizar theta complementary
+    theta = 0.98f * (theta + theta_dot * 0.02f) + 0.02f * accelAngle;
+    angleFiltered = theta; // en rad
+
+    // Seguridad: si se excede ángulo máximo -> detener motores
+    if (fabs(rad2deg(angleFiltered)) > MAX_ANGLE_DEG)
+    {
+      driveMotorsDifferential(0.0f, 0.0f);
+      Serial.println("SAFETY STOP: angle exceeded");
+      continue;
+    }
+
+    // --- estado x = [theta, theta_dot, v]
+    float u = lqr_control(theta, theta_dot, v); // salida en "PWM units"
+
+    // guardar en variables para web (asegurar atomicidad)
+    {
+      portENTER_CRITICAL(&mux);
+      last_u = u;
+      last_v = v;
+      last_theta_dot = theta_dot;
+      portEXIT_CRITICAL(&mux);
+    }
+
+    // --- aplicar corrección de linea (factor_giro) multiplicativa
+    float pwm_base = constrain(u, -PWM_LIMIT, PWM_LIMIT);
+
+    // Si factor_giro => mezcla multiplicativa como antes
+    float pwmL = pwm_base * (1.0f + factor_giro);
+    float pwmR = pwm_base * (1.0f - factor_giro);
+
+    pwmL = constrain(pwmL, -PWM_LIMIT, PWM_LIMIT);
+    pwmR = constrain(pwmR, -PWM_LIMIT, PWM_LIMIT);
+
+    driveMotorsDifferential(pwmL, pwmR);
+
+    // Enviar por websocket cada WS_SEND_PERIOD_MS
+    if (millis() - lastWs >= (unsigned long)WS_SEND_PERIOD_MS)
+    {
+      lastWs = millis();
+      char payload[256];
+      float theta_deg = rad2deg(theta);
+      float theta_dot_deg = rad2deg(theta_dot);
+      // leer K de forma segura
+      float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+      int len = snprintf(payload, sizeof(payload),
+                         "{\"theta\":%.3f,\"theta_dot\":%.3f,\"v\":%.4f,\"u\":%.3f,\"factor_giro\":%.4f,\"K0\":%.3f,\"K1\":%.3f,\"K2\":%.3f}",
+                         theta_deg, theta_dot_deg, v, u, factor_giro, k0, k1, k2);
+      if (len > 0)
+        ws.textAll(payload);
+    }
+
+// debug opcional (baja frecuencia)
+#if 0
+    Serial.printf("theta(deg)=%.2f, theta_dot=%.2f, v=%.3f m/s | u=%.1f | fg=%.3f\r\n",
+                  rad2deg(theta), rad2deg(theta_dot), v, u, factor_giro);
+#endif
+  }
+}
+
+// ----------------------- TASK LINEA (Core 0) -------------------
+void TaskLinea(void *pvParameters)
+{
+  const TickType_t period = pdMS_TO_TICKS(100); // 10 Hz
+  TickType_t lastWake = xTaskGetTickCount();
+  pidLinea.SetMode(AUTOMATIC);
+  pidLinea.SetOutputLimits(-0.6, 0.6);
+  pidLinea.SetSampleTime(100);
+
+  while (true)
+  {
+    vTaskDelayUntil(&lastWake, period);
+
+    int suma = 0;
+    long pos = 0;
+    for (int i = 0; i < NUM_SENSORS; ++i)
+    {
+      int val = (digitalRead(sensorPins[i]) == LOW) ? 1 : 0; // negro = LOW
+      suma += val;
+      pos += val * i * 100;
+    }
+    if (suma > 0)
+    {
+      lineInput = (double)pos / (double)suma;
+      pidLinea.Compute();
+      factor_giro = constrain((float)lineOutput, -0.6f, 0.6f);
+    }
+    else
+    {
+      factor_giro = 0.0f;
+    }
+  }
+}
+
+// ----------------------- CALIBRACIÓN MPU -----------------------
+void calibrateMPU()
+{
+  const int samples = 500;
+  long ax_sum = 0, ay_sum = 0, az_sum = 0, gx_sum = 0;
+  for (int i = 0; i < samples; ++i)
+  {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    gx_sum += gx;
+    delay(3);
+  }
+  ax_offset = (float)ax_sum / samples;
+  ay_offset = (float)ay_sum / samples;
+  az_offset = ((float)az_sum / samples) - 16384.0f;
+  gx_offset = (float)gx_sum / samples;
+
+  // angle inicial (rad)
+  int16_t ax0, ay0, az0;
+  mpu.getAcceleration(&ax0, &ay0, &az0);
+  angleFiltered = atan2f(((float)ay0 - ay_offset) / 16384.0f, ((float)az0 - az_offset) / 16384.0f);
+}
+
+// ----------------------- INDEX.HTML SERVIDO -------------------
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Robot Dashboard</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+    body {
+        margin: 0;
+        background-color: #0f111a;
+        font-family: Arial, sans-serif;
+        color: #e8e9ea;
+    }
+
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-gap: 20px;
+        padding: 20px;
+    }
+
+    .card {
+        background: #1c1f2b;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.4);
+    }
+
+    h2 {
+        margin: 0 0 10px;
+        color: #a9cdfc;
+        font-weight: 600;
+        font-size: 18px;
+    }
+
+    canvas {
+        width: 100% !important;
+        height: 260px !important;
+    }
+</style>
+</head>
+
+<body>
+<div class="grid">
+
+    <!-- LINEA DE TIEMPO: error o linePosition -->
+    <div class="card">
+        <h2>Error (Tiempo Real)</h2>
+        <canvas id="chartRealtime"></canvas>
+    </div>
+
+    <!-- PID OUTPUT -->
+    <div class="card">
+        <h2>PID Output</h2>
+        <canvas id="chartPID"></canvas>
+    </div>
+
+    <!-- QTR8A -->
+    <div class="card">
+        <h2>Sensores QTR8A</h2>
+        <canvas id="chartQTR"></canvas>
+    </div>
+
+</div>
+
+<script>
+
+let realtimeData = [];
+let realtimeLabels = [];
+
+///////////////////////////////////////////////////////////
+// CHART 1 – ERROR O POSICIÓN
+///////////////////////////////////////////////////////////
+const chartRealtime = new Chart(
+    document.getElementById('chartRealtime'),
+    {
+        type: 'line',
+        data: {
+            labels: realtimeLabels,
+            datasets: [{
+                label: 'Error',
+                data: realtimeData,
+                borderColor: '#4cc9f0',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.3
+            }]
+        },
+        options: { animation: false }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// CHART 2 – PID OUTPUT GAUGE
+///////////////////////////////////////////////////////////
+const chartPID = new Chart(
+    document.getElementById('chartPID'),
+    {
+        type: 'doughnut',
+        data: {
+            labels: ['PID', 'Restante'],
+            datasets: [{
+                data: [0, 255],
+                backgroundColor: ['#f9c74f', '#2a2d3a'],
+                borderWidth: 0
+            }]
+        },
+        options: {
+            cutout: '70%',
+            plugins: { legend: { display: false } }
+        }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// CHART 3 – QTR8A
+///////////////////////////////////////////////////////////
+const chartQTR = new Chart(
+    document.getElementById('chartQTR'),
+    {
+        type: 'line',
+        data: {
+            labels: ["S1","S2","S3","S4","S5","S6","S7","S8"],
+            datasets: [{
+                label: "QTR",
+                data: [0,0,0,0,0,0,0,0],
+                borderColor: "#4287f5",
+                backgroundColor: "rgba(66, 135, 245, 0.4)",
+                fill: true,
+                tension: 0.3
+            }]
+        },
+        options: { animation: false }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// ACTUALIZAR GRÁFICAS
+///////////////////////////////////////////////////////////
+function updateCharts(data) {
+
+    const now = new Date().toLocaleTimeString();
+    realtimeLabels.push(now);
+    realtimeData.push(data.error);
+
+    if (realtimeLabels.length > 20) {
+        realtimeLabels.shift();
+        realtimeData.shift();
+    }
+    chartRealtime.update();
+
+    chartPID.data.datasets[0].data = [
+        Math.abs(data.pidOutput),
+        255 - Math.abs(data.pidOutput)
+    ];
+    chartPID.update();
+
+    chartQTR.data.datasets[0].data = data.qtr;
+    chartQTR.update();
+}
+
+///////////////////////////////////////////////////////////
+// WEBSOCKET REAL
+///////////////////////////////////////////////////////////
+const socket = new WebSocket("ws://192.168.4.1/ws");
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    updateCharts({
+        error: data.error,
+        pidOutput: data.pidOutput,
+        qtr: data.qtr
+    });
+};
+
+</script>
+</body>
+</html>
+
+
+)rawliteral";
+
+// ----------------------- SETUP --------------------------------
+void setup()
+{
+  Serial.begin(115200);
+  delay(50);
+
+  // Pines motores
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  // PWM
+  setupMotorPWM(PWMA, CH_A, 0);
+  setupMotorPWM(PWMB, CH_B, 1);
+
+  // Encoders
+  pinMode(R_A, INPUT_PULLUP);
+  pinMode(R_B, INPUT_PULLUP);
+  pinMode(L_A, INPUT_PULLUP);
+  pinMode(L_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(R_A), isr_RA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(L_A), isr_LA, CHANGE);
+
+  // Sensores línea
+  for (int i = 0; i < NUM_SENSORS; ++i)
+    pinMode(sensorPins[i], INPUT);
+
+  // IMU
+  Wire.begin(41, 42); // SDA, SCL (ajusta según tu wiring)
+  mpu.initialize();
+  delay(50);
+  calibrateMPU();
+
+  pidLinea.SetMode(AUTOMATIC);
+  pidLinea.SetOutputLimits(-0.6, 0.6);
+
+  // WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Conectando WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000)
+  {
+    delay(250);
+    Serial.print('.');
+  }
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.print("WiFi OK. IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println();
+    Serial.println("WiFi falló o timeout. Considera usar AP si es necesario.");
+  }
+
+  // configurar websocket y servidor
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // servir index
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send_P(200, "text/html", index_html); });
+
+  // endpoint /status (JSON)
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    char buf[256];
+    portENTER_CRITICAL(&mux);
+    float theta_deg = rad2deg(angleFiltered);
+    float v_local = last_v;
+    float theta_dot_deg = rad2deg(last_theta_dot);
+    float u_local = last_u;
+    float fg = factor_giro;
+    float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+    portEXIT_CRITICAL(&mux);
+    int n = snprintf(buf, sizeof(buf),
+      "{\"theta\":%.3f,\"theta_dot\":%.3f,\"v\":%.4f,\"u\":%.3f,\"factor_giro\":%.4f,\"K0\":%.3f,\"K1\":%.3f,\"K2\":%.3f}",
+      theta_deg, theta_dot_deg, v_local, u_local, fg, k0,k1,k2);
+    request->send(200, "application/json", buf); });
+
+  server.begin();
+  Serial.println("Web server started");
+
+  // Crear tareas (Balanceo en Core1, Línea en Core0)
+  BaseType_t t1 = xTaskCreatePinnedToCore(TaskBalanceo, "Balanceo", 10000, NULL, 3, NULL, 1);
+  BaseType_t t2 = xTaskCreatePinnedToCore(TaskLinea, "Linea", 4000, NULL, 1, NULL, 0);
+  if (t1 != pdPASS || t2 != pdPASS)
+  {
+    Serial.println("ERROR creando tareas FreeRTOS");
+    while (1)
+      delay(1000);
+  }
+
+  Serial.println("Sistema LQR inicializado. Ajusta K_LQR en el código o vía Serial.");
+}
+
+// ----------------------- LOOP ---------------------------------
+void loop()
+{
+  // comando por serie para ajustar K sin recompilar
+  // Formato: K k0 k1 k2  (ej: K 160 8 18)
+  if (Serial.available())
+  {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (s.length() > 0 && s.charAt(0) == 'K')
+    {
+      // parse
+      float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+      int scanned = sscanf(s.c_str() + 1, "%f %f %f", &k0, &k1, &k2);
+      if (scanned >= 1)
+        K_LQR[0] = k0;
+      if (scanned >= 2)
+        K_LQR[1] = k1;
+      if (scanned >= 3)
+        K_LQR[2] = k2;
+      Serial.printf("New K: [%.3f, %.3f, %.3f]\r\n", K_LQR[0], K_LQR[1], K_LQR[2]);
+    }
+    // puedes añadir más comandos (por ejemplo Q para impresión de estado)
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+=======
+
+
+/* CascadaPrueba_LQR_Web.ino
+   LQR state-feedback controller (práctico) para ESP32-S3
+   Conserva PID para seguidor de línea.
+   Añadido: servidor web + WebSocket para telemetría.
+   Autor: Adaptado y optimizado (para tu base)
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <driver/ledc.h>
+#include <PID_v1.h>
+
+// Web & Async
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+// ----------------------- CONFIG WIFI --------------------------
+const char *WIFI_SSID = "Calderon Ramon"; // <-- sustituye
+const char *WIFI_PASS = "Lina.Alex.321";  // <-- sustituye
+
+// ---------- WEBSERVER / WEBSOCKET ----------
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+const int WS_SEND_PERIOD_MS = 50; // intervalo de envío WS (ms) -> 20 Hz
+
+// ----------------------- HARDWARE PINS -------------------------
+#define AIN1 7
+#define AIN2 6
+#define PWMA 5
+#define BIN1 16
+#define BIN2 17
+#define PWMB 18
+#define STBY 15
+
+// ENCODERS
+#define R_A 3
+#define R_B 46
+#define L_A 9
+#define L_B 11
+
+// SENSORES LINEA (mantener como en tu diseño)
+#define NUM_SENSORS 8
+const uint8_t sensorPins[NUM_SENSORS] = {40, 38, 37, 36, 35, 0, 45, 48};
+
+// ----------------------- PWM / LEDC ---------------------------
+#define PWM_FREQ 20000
+#define PWM_RES 8
+const ledc_channel_t CH_A = LEDC_CHANNEL_0;
+const ledc_channel_t CH_B = LEDC_CHANNEL_1;
+
+// ----------------------- IMU / ENCODERS -----------------------
+MPU6050 mpu;
+volatile long countR = 0;
+volatile long countL = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // para acceso crítico
+
+// Ajusta según tu reductor / encoder (pulses per revolution)
+const float PPR = 44.0f * 119.0f;
+
+// Parámetros físicos (ajusta wheel radius si quieres velocidad en m/s)
+const float WHEEL_RADIUS = 0.03f; // m (ejemplo 3 cm). AJUSTAR.
+const float WHEEL_BASE = 0.12f;   // distancia entre ruedas en m (opcional).
+
+// ----------------------- ESTADO / OFFSET IMU ------------------
+float ax_offset = 0, ay_offset = 0, az_offset = 0;
+float gx_offset = 0;
+float angleFiltered = 0.0f; // rad
+
+// ----------------------- LQR (ganancias) ----------------------
+// Estado x = [ theta (rad), theta_dot (rad/s), v (m/s) ]
+// Control u = -K * x  -> u es señal base para motores (PWM target, sign handled)
+float K_LQR[3] = {150.0f, 8.0f, 20.0f}; // valores iniciales SUGERIDOS — TUNEAR
+
+// Saturaciones
+const float PWM_LIMIT = 255.0f;
+const float MAX_ANGLE_DEG = 40.0f;
+
+// ----------------------- PID LINEA ----------------------------
+volatile float factor_giro = 0.0f;
+double lineInput = 0, lineOutput = 0, lineSetpoint = 350.0;
+double Kp_line = 40.0, Ki_line = 0.0, Kd_line = 12.0;
+PID pidLinea(&lineInput, &lineOutput, &lineSetpoint, Kp_line, Ki_line, Kd_line, DIRECT);
+
+// ----------------------- TELEMETRÍA (variables para web) ------
+float last_u = 0.0f;
+float last_v = 0.0f;
+float last_theta_dot = 0.0f;
+
+// ----------------------- ISRs ENCODER -------------------------
+void IRAM_ATTR isr_RA()
+{
+  if (digitalRead(R_A) == digitalRead(R_B))
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countR++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+  else
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countR--;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+void IRAM_ATTR isr_LA()
+{
+  if (digitalRead(L_A) == digitalRead(L_B))
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countL++;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+  else
+  {
+    portENTER_CRITICAL_ISR(&mux);
+    countL--;
+    portEXIT_CRITICAL_ISR(&mux);
+  }
+}
+
+// ----------------------- PWM setup & drive ---------------------
+void setupMotorPWM(int pwmPin, int pwmChannel, int timerNum)
+{
+  ledc_timer_config_t timer_conf = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = (ledc_timer_t)timerNum,
+      .freq_hz = PWM_FREQ,
+      .clk_cfg = LEDC_AUTO_CLK};
+  ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t channel_conf = {
+      .gpio_num = pwmPin,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = (ledc_channel_t)pwmChannel,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = (ledc_timer_t)timerNum,
+      .duty = 0};
+  ledc_channel_config(&channel_conf);
+}
+
+// aplica pwm diferencial. pwmL/pwmR en rango [-255,255]
+void driveMotorsDifferential(float pwmL, float pwmR)
+{
+  digitalWrite(STBY, HIGH);
+
+  int dutyL = constrain((int)fabs(pwmL), 0, 255);
+  int dutyR = constrain((int)fabs(pwmR), 0, 255);
+
+  if (pwmL >= 0)
+  {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  }
+  else
+  {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  }
+
+  if (pwmR >= 0)
+  {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  }
+  else
+  {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  }
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_A, dutyL);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_A);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_B, dutyR);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_B);
+}
+
+// ----------------------- UTILIDADES ---------------------------
+static inline float rpm_to_mps(float rpm)
+{
+  // rpm -> revoluciones/s -> m/s
+  float rps = rpm / 60.0f;
+  return rps * (2.0f * PI * WHEEL_RADIUS);
+}
+
+// convierte grados a rad
+static inline float deg2rad(float d) { return d * (PI / 180.0f); }
+static inline float rad2deg(float r) { return r * (180.0f / PI); }
+
+// lectura atómica de contadores
+void readAndClearEncoders(long &r, long &l)
+{
+  portENTER_CRITICAL(&mux);
+  r = countR;
+  l = countL;
+  countR = 0;
+  countL = 0;
+  portEXIT_CRITICAL(&mux);
+}
+
+// ----------------------- CONTROL LQR --------------------------
+// devuelve u = -K*x  (u en "unidades PWM").
+// x: theta(rad), theta_dot(rad/s), v(m/s)
+float lqr_control(float theta, float theta_dot, float v)
+{
+  // vector multiply
+  float u = -(K_LQR[0] * theta + K_LQR[1] * theta_dot + K_LQR[2] * v);
+  // opcional: anti-wind, smooth, o feedforward puede añadirse aquí
+  return u;
+}
+
+// ----------------------- WEBSOCKET HANDLER --------------------
+void onWsEvent(AsyncWebSocket *serverPtr, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+  if (type == WS_EVT_CONNECT)
+  {
+    Serial.printf("WS client %u connected\n", client->id());
+  }
+  else if (type == WS_EVT_DISCONNECT)
+  {
+    Serial.printf("WS client %u disconnected\n", client->id());
+  }
+  else if (type == WS_EVT_DATA)
+  {
+    // Procesar mensajes entrantes si lo deseas (por ejemplo comandos)
+    // Actualmente no usamos mensajes entrantes.
+  }
+}
+
+// ----------------------- TASK BALANCEO (Core 1) ---------------
+void TaskBalanceo(void *pvParameters)
+{
+  const TickType_t period = pdMS_TO_TICKS(20); // 50 Hz
+  TickType_t lastWake = xTaskGetTickCount();
+
+  unsigned long lastWs = 0;
+
+  while (true)
+  {
+    vTaskDelayUntil(&lastWake, period);
+
+    // --- leer encoders atómicamente ---
+    long pulsesR = 0, pulsesL = 0;
+    readAndClearEncoders(pulsesR, pulsesL);
+
+    // calcular RPM (pulses -> rev -> rpm)
+    float revR = pulsesR / PPR;
+    float revL = pulsesL / PPR;
+    float rpmR = (revR / 0.02f) * 60.0f; // periodo 20 ms
+    float rpmL = (revL / 0.02f) * 60.0f;
+
+    // velocidad lineal (m/s) - promedio ruedas
+    float vR = rpm_to_mps(rpmR);
+    float vL = rpm_to_mps(rpmL);
+    float v = 0.5f * (vR + vL);
+
+    // --- IMU ---
+    int16_t ax_i, ay_i, az_i, gx_i, gy_i, gz_i;
+    mpu.getMotion6(&ax_i, &ay_i, &az_i, &gx_i, &gy_i, &gz_i);
+
+    float ay = (float)ay_i - ay_offset;
+    float az = (float)az_i - az_offset;
+    float gx = ((float)gx_i - gx_offset) / 131.0f; // deg/s
+    // convertir a rad/s
+    float gx_rad = deg2rad(gx);
+
+    // complementary filter: angle in radians
+    float accelAngle = atan2f(ay, az); // rad
+    // estimación de vel ang = gx_rad
+    static float theta = 0.0f;
+    static float theta_dot = 0.0f;
+
+    // calcular theta_dot a partir de gyro (más robusto) y filtro
+    theta_dot = gx_rad;
+    // actualizar theta complementary
+    theta = 0.98f * (theta + theta_dot * 0.02f) + 0.02f * accelAngle;
+    angleFiltered = theta; // en rad
+
+    // Seguridad: si se excede ángulo máximo -> detener motores
+    if (fabs(rad2deg(angleFiltered)) > MAX_ANGLE_DEG)
+    {
+      driveMotorsDifferential(0.0f, 0.0f);
+      Serial.println("SAFETY STOP: angle exceeded");
+      continue;
+    }
+
+    // --- estado x = [theta, theta_dot, v]
+    float u = lqr_control(theta, theta_dot, v); // salida en "PWM units"
+
+    // guardar en variables para web (asegurar atomicidad)
+    {
+      portENTER_CRITICAL(&mux);
+      last_u = u;
+      last_v = v;
+      last_theta_dot = theta_dot;
+      portEXIT_CRITICAL(&mux);
+    }
+
+    // --- aplicar corrección de linea (factor_giro) multiplicativa
+    float pwm_base = constrain(u, -PWM_LIMIT, PWM_LIMIT);
+
+    // Si factor_giro => mezcla multiplicativa como antes
+    float pwmL = pwm_base * (1.0f + factor_giro);
+    float pwmR = pwm_base * (1.0f - factor_giro);
+
+    pwmL = constrain(pwmL, -PWM_LIMIT, PWM_LIMIT);
+    pwmR = constrain(pwmR, -PWM_LIMIT, PWM_LIMIT);
+
+    driveMotorsDifferential(pwmL, pwmR);
+
+    // Enviar por websocket cada WS_SEND_PERIOD_MS
+    if (millis() - lastWs >= (unsigned long)WS_SEND_PERIOD_MS)
+    {
+      lastWs = millis();
+      char payload[256];
+      float theta_deg = rad2deg(theta);
+      float theta_dot_deg = rad2deg(theta_dot);
+      // leer K de forma segura
+      float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+      int len = snprintf(payload, sizeof(payload),
+                         "{\"theta\":%.3f,\"theta_dot\":%.3f,\"v\":%.4f,\"u\":%.3f,\"factor_giro\":%.4f,\"K0\":%.3f,\"K1\":%.3f,\"K2\":%.3f}",
+                         theta_deg, theta_dot_deg, v, u, factor_giro, k0, k1, k2);
+      if (len > 0)
+        ws.textAll(payload);
+    }
+
+// debug opcional (baja frecuencia)
+#if 0
+    Serial.printf("theta(deg)=%.2f, theta_dot=%.2f, v=%.3f m/s | u=%.1f | fg=%.3f\r\n",
+                  rad2deg(theta), rad2deg(theta_dot), v, u, factor_giro);
+#endif
+  }
+}
+
+// ----------------------- TASK LINEA (Core 0) -------------------
+void TaskLinea(void *pvParameters)
+{
+  const TickType_t period = pdMS_TO_TICKS(100); // 10 Hz
+  TickType_t lastWake = xTaskGetTickCount();
+  pidLinea.SetMode(AUTOMATIC);
+  pidLinea.SetOutputLimits(-0.6, 0.6);
+  pidLinea.SetSampleTime(100);
+
+  while (true)
+  {
+    vTaskDelayUntil(&lastWake, period);
+
+    int suma = 0;
+    long pos = 0;
+    for (int i = 0; i < NUM_SENSORS; ++i)
+    {
+      int val = (digitalRead(sensorPins[i]) == LOW) ? 1 : 0; // negro = LOW
+      suma += val;
+      pos += val * i * 100;
+    }
+    if (suma > 0)
+    {
+      lineInput = (double)pos / (double)suma;
+      pidLinea.Compute();
+      factor_giro = constrain((float)lineOutput, -0.6f, 0.6f);
+    }
+    else
+    {
+      factor_giro = 0.0f;
+    }
+  }
+}
+
+// ----------------------- CALIBRACIÓN MPU -----------------------
+void calibrateMPU()
+{
+  const int samples = 500;
+  long ax_sum = 0, ay_sum = 0, az_sum = 0, gx_sum = 0;
+  for (int i = 0; i < samples; ++i)
+  {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    gx_sum += gx;
+    delay(3);
+  }
+  ax_offset = (float)ax_sum / samples;
+  ay_offset = (float)ay_sum / samples;
+  az_offset = ((float)az_sum / samples) - 16384.0f;
+  gx_offset = (float)gx_sum / samples;
+
+  // angle inicial (rad)
+  int16_t ax0, ay0, az0;
+  mpu.getAcceleration(&ax0, &ay0, &az0);
+  angleFiltered = atan2f(((float)ay0 - ay_offset) / 16384.0f, ((float)az0 - az_offset) / 16384.0f);
+}
+
+// ----------------------- INDEX.HTML SERVIDO -------------------
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Robot Dashboard</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+    body {
+        margin: 0;
+        background-color: #0f111a;
+        font-family: Arial, sans-serif;
+        color: #e8e9ea;
+    }
+
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-gap: 20px;
+        padding: 20px;
+    }
+
+    .card {
+        background: #1c1f2b;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.4);
+    }
+
+    h2 {
+        margin: 0 0 10px;
+        color: #a9cdfc;
+        font-weight: 600;
+        font-size: 18px;
+    }
+
+    canvas {
+        width: 100% !important;
+        height: 260px !important;
+    }
+</style>
+</head>
+
+<body>
+<div class="grid">
+
+    <!-- LINEA DE TIEMPO: error o linePosition -->
+    <div class="card">
+        <h2>Error (Tiempo Real)</h2>
+        <canvas id="chartRealtime"></canvas>
+    </div>
+
+    <!-- PID OUTPUT -->
+    <div class="card">
+        <h2>PID Output</h2>
+        <canvas id="chartPID"></canvas>
+    </div>
+
+    <!-- QTR8A -->
+    <div class="card">
+        <h2>Sensores QTR8A</h2>
+        <canvas id="chartQTR"></canvas>
+    </div>
+
+</div>
+
+<script>
+
+let realtimeData = [];
+let realtimeLabels = [];
+
+///////////////////////////////////////////////////////////
+// CHART 1 – ERROR O POSICIÓN
+///////////////////////////////////////////////////////////
+const chartRealtime = new Chart(
+    document.getElementById('chartRealtime'),
+    {
+        type: 'line',
+        data: {
+            labels: realtimeLabels,
+            datasets: [{
+                label: 'Error',
+                data: realtimeData,
+                borderColor: '#4cc9f0',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.3
+            }]
+        },
+        options: { animation: false }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// CHART 2 – PID OUTPUT GAUGE
+///////////////////////////////////////////////////////////
+const chartPID = new Chart(
+    document.getElementById('chartPID'),
+    {
+        type: 'doughnut',
+        data: {
+            labels: ['PID', 'Restante'],
+            datasets: [{
+                data: [0, 255],
+                backgroundColor: ['#f9c74f', '#2a2d3a'],
+                borderWidth: 0
+            }]
+        },
+        options: {
+            cutout: '70%',
+            plugins: { legend: { display: false } }
+        }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// CHART 3 – QTR8A
+///////////////////////////////////////////////////////////
+const chartQTR = new Chart(
+    document.getElementById('chartQTR'),
+    {
+        type: 'line',
+        data: {
+            labels: ["S1","S2","S3","S4","S5","S6","S7","S8"],
+            datasets: [{
+                label: "QTR",
+                data: [0,0,0,0,0,0,0,0],
+                borderColor: "#4287f5",
+                backgroundColor: "rgba(66, 135, 245, 0.4)",
+                fill: true,
+                tension: 0.3
+            }]
+        },
+        options: { animation: false }
+    }
+);
+
+///////////////////////////////////////////////////////////
+// ACTUALIZAR GRÁFICAS
+///////////////////////////////////////////////////////////
+function updateCharts(data) {
+
+    const now = new Date().toLocaleTimeString();
+    realtimeLabels.push(now);
+    realtimeData.push(data.error);
+
+    if (realtimeLabels.length > 20) {
+        realtimeLabels.shift();
+        realtimeData.shift();
+    }
+    chartRealtime.update();
+
+    chartPID.data.datasets[0].data = [
+        Math.abs(data.pidOutput),
+        255 - Math.abs(data.pidOutput)
+    ];
+    chartPID.update();
+
+    chartQTR.data.datasets[0].data = data.qtr;
+    chartQTR.update();
+}
+
+///////////////////////////////////////////////////////////
+// WEBSOCKET REAL
+///////////////////////////////////////////////////////////
+const socket = new WebSocket("ws://192.168.4.1/ws");
+
+socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    updateCharts({
+        error: data.error,
+        pidOutput: data.pidOutput,
+        qtr: data.qtr
+    });
+};
+
+</script>
+</body>
+</html>
+
+
+)rawliteral";
+
+// ----------------------- SETUP --------------------------------
+void setup()
+{
+  Serial.begin(115200);
+  delay(50);
+
+  // Pines motores
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  // PWM
+  setupMotorPWM(PWMA, CH_A, 0);
+  setupMotorPWM(PWMB, CH_B, 1);
+
+  // Encoders
+  pinMode(R_A, INPUT_PULLUP);
+  pinMode(R_B, INPUT_PULLUP);
+  pinMode(L_A, INPUT_PULLUP);
+  pinMode(L_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(R_A), isr_RA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(L_A), isr_LA, CHANGE);
+
+  // Sensores línea
+  for (int i = 0; i < NUM_SENSORS; ++i)
+    pinMode(sensorPins[i], INPUT);
+
+  // IMU
+  Wire.begin(41, 42); // SDA, SCL (ajusta según tu wiring)
+  mpu.initialize();
+  delay(50);
+  calibrateMPU();
+
+  pidLinea.SetMode(AUTOMATIC);
+  pidLinea.SetOutputLimits(-0.6, 0.6);
+
+  // WIFI
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Conectando WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 8000)
+  {
+    delay(250);
+    Serial.print('.');
+  }
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println();
+    Serial.print("WiFi OK. IP: ");
+    Serial.println(WiFi.localIP());
+  }
+  else
+  {
+    Serial.println();
+    Serial.println("WiFi falló o timeout. Considera usar AP si es necesario.");
+  }
+
+  // configurar websocket y servidor
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+
+  // servir index
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send_P(200, "text/html", index_html); });
+
+  // endpoint /status (JSON)
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+            {
+    char buf[256];
+    portENTER_CRITICAL(&mux);
+    float theta_deg = rad2deg(angleFiltered);
+    float v_local = last_v;
+    float theta_dot_deg = rad2deg(last_theta_dot);
+    float u_local = last_u;
+    float fg = factor_giro;
+    float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+    portEXIT_CRITICAL(&mux);
+    int n = snprintf(buf, sizeof(buf),
+      "{\"theta\":%.3f,\"theta_dot\":%.3f,\"v\":%.4f,\"u\":%.3f,\"factor_giro\":%.4f,\"K0\":%.3f,\"K1\":%.3f,\"K2\":%.3f}",
+      theta_deg, theta_dot_deg, v_local, u_local, fg, k0,k1,k2);
+    request->send(200, "application/json", buf); });
+
+  server.begin();
+  Serial.println("Web server started");
+
+  // Crear tareas (Balanceo en Core1, Línea en Core0)
+  BaseType_t t1 = xTaskCreatePinnedToCore(TaskBalanceo, "Balanceo", 10000, NULL, 3, NULL, 1);
+  BaseType_t t2 = xTaskCreatePinnedToCore(TaskLinea, "Linea", 4000, NULL, 1, NULL, 0);
+  if (t1 != pdPASS || t2 != pdPASS)
+  {
+    Serial.println("ERROR creando tareas FreeRTOS");
+    while (1)
+      delay(1000);
+  }
+
+  Serial.println("Sistema LQR inicializado. Ajusta K_LQR en el código o vía Serial.");
+}
+
+// ----------------------- LOOP ---------------------------------
+void loop()
+{
+  // comando por serie para ajustar K sin recompilar
+  // Formato: K k0 k1 k2  (ej: K 160 8 18)
+  if (Serial.available())
+  {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (s.length() > 0 && s.charAt(0) == 'K')
+    {
+      // parse
+      float k0 = K_LQR[0], k1 = K_LQR[1], k2 = K_LQR[2];
+      int scanned = sscanf(s.c_str() + 1, "%f %f %f", &k0, &k1, &k2);
+      if (scanned >= 1)
+        K_LQR[0] = k0;
+      if (scanned >= 2)
+        K_LQR[1] = k1;
+      if (scanned >= 3)
+        K_LQR[2] = k2;
+      Serial.printf("New K: [%.3f, %.3f, %.3f]\r\n", K_LQR[0], K_LQR[1], K_LQR[2]);
+    }
+    // puedes añadir más comandos (por ejemplo Q para impresión de estado)
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+>>>>>>> ec42d93 (Inicial all)
