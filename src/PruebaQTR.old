@@ -1,0 +1,46 @@
+#include <Arduino.h>
+
+const uint8_t sensorCount = 8;
+const uint8_t sensorPins[sensorCount] = {40, 38, 37, 36, 35, 0, 45, 48};
+uint8_t sensorValues[sensorCount];
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("=== Prueba Sensor QTR Digital (ESP32-S3) ===");
+
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    // Pines con pulldown seguro
+    if (sensorPins[i] == 40 || sensorPins[i] == 38 ||
+        sensorPins[i] == 37 || sensorPins[i] == 36 || sensorPins[i] == 35) {
+
+      pinMode(sensorPins[i], INPUT_PULLDOWN);   // seguro
+      Serial.printf("Pin %u configurado como INPUT_PULLDOWN\n", sensorPins[i]);
+
+    } else {
+      // Pines especiales → usar INPUT "limpio"
+      pinMode(sensorPins[i], INPUT);
+      Serial.printf("Pin %u configurado como INPUT (sin pulldown por seguridad)\n", sensorPins[i]);
+    }
+  }
+
+  Serial.println("\nListo. Leyendo sensores...\n");
+}
+
+void loop() {
+  // Leer sensores digitales
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    sensorValues[i] = digitalRead(sensorPins[i]);
+  }
+
+  // Mostrar lectura
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    Serial.print(sensorValues[i]);
+    Serial.print('\t');
+  }
+
+  Serial.println();
+
+  delay(200);
+}
