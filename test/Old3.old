@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 
 
 /* CascadaPrueba_LQR_Web.ino
@@ -715,6 +718,7 @@ void loop()
   }
   vTaskDelay(pdMS_TO_TICKS(100));
 }
+<<<<<<< HEAD
 =======
 
 
@@ -1433,3 +1437,5 @@ void loop()
   vTaskDelay(pdMS_TO_TICKS(100));
 }
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)

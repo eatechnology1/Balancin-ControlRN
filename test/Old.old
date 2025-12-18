@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 #include <Arduino.h>
 #include "Neural_Networks_FF.h"
 #include <ESP32Servo.h>
@@ -79,6 +82,7 @@ void loop() {
     
 }
 
+<<<<<<< HEAD
 =======
 #include <Arduino.h>
 #include "Neural_Networks_FF.h"
@@ -161,3 +165,5 @@ void loop() {
 }
 
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)

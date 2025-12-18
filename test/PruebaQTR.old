@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 #include <Arduino.h>
 
 const uint8_t sensorCount = 8;
@@ -45,6 +48,7 @@ void loop() {
 
   delay(200);
 }
+<<<<<<< HEAD
 =======
 #include <Arduino.h>
 
@@ -93,3 +97,5 @@ void loop() {
   delay(200);
 }
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)

@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 #include <Arduino.h>
 #include "Neural_Networks_FF.h"
 #include <Wire.h>
@@ -598,6 +601,7 @@ void loop()
 
      vTaskDelay(pdMS_TO_TICKS(10)); // 10 ms
   }
+<<<<<<< HEAD
 =======
 #include <Arduino.h>
 #include "Neural_Networks_FF.h"
@@ -1199,4 +1203,6 @@ void loop()
      vTaskDelay(pdMS_TO_TICKS(10)); // 10 ms
   }
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)
 }

@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 /**
  * @file main.cpp
  * @brief Balancing line-following robot firmware for ESP32-S3 using MPU6050, encoders,
@@ -802,6 +805,7 @@ void loop()
 
     delay(500); // anti-rebote para no volver a entrar inmediatamente
   }
+<<<<<<< HEAD
 =======
 /**
  * @file main.cpp
@@ -1607,4 +1611,6 @@ void loop()
     delay(500); // anti-rebote para no volver a entrar inmediatamente
   }
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)
 }

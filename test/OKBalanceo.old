@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> e23c40d (New Version)
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU6050.h>
@@ -465,6 +468,7 @@ void loop() {
 
     delay(500); // anti-rebote para no volver a entrar inmediatamente
   }
+<<<<<<< HEAD
 =======
 #include <Arduino.h>
 #include <Wire.h>
@@ -933,4 +937,6 @@ void loop() {
     delay(500); // anti-rebote para no volver a entrar inmediatamente
   }
 >>>>>>> ec42d93 (Inicial all)
+=======
+>>>>>>> e23c40d (New Version)
 }
