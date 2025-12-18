@@ -32,13 +32,13 @@ El objetivo es mantener el robot vertical y, al mismo tiempo, seguir una línea 
 - `encoders.h`  
   - Variables `volatile long countL, countR`.
   - ISRs `isr_LA`, `isr_RA` que actualizan los contadores según la fase A/B del encoder.
-  - Funciones auxiliares (en tu código principal) calculan RPM a partir de los conteos y el tiempo.
+  - Funciones auxiliares en el código principal calculan RPM a partir de los conteos y el tiempo.
 
 - `motors.h`  
-  - Configuración de timers y canales PWM de **LEDC** (modo low-speed).
+  - Configuración de timers y canales PWM de LEDC (modo low-speed).
   - Función `driveMotorsDifferential(pwmL, pwmR)`:
     - Determina dirección (adelante/atrás) según el signo.
-    - Hace `constrain` de |PWM| a [0, 255].
+    - Aplica `constrain` de \(|PWM|\) a \([0, 255]\).
     - Actualiza el duty de cada canal.
 
 - `mpu_block.h`  
@@ -76,43 +76,34 @@ El objetivo es mantener el robot vertical y, al mismo tiempo, seguir una línea 
 
 ### 3.1. Variables principales
 
-- \( \theta \): ángulo del robot respecto a la vertical (rad o grados, en el código se maneja en grados y se escala a rad solo cuando hace falta).
+- \( \theta \): ángulo del robot respecto a la vertical (rad o grados).
 - \( \dot{\theta} \): velocidad angular (derivada del giroscopio).
 - \( v_L, v_R \): velocidades de las ruedas izquierda y derecha (RPM).
 - \( v \): velocidad lineal aproximada del robot (media de ambas ruedas).
-- `angleFiltered`: estimación de \(\theta\) tras el filtro complementario.
+- `angleFiltered`: estimación de \( \theta \) tras el filtro complementario.
 - `rpmL_f`, `rpmR_f`: velocidades filtradas.
 
 ### 3.2. Encoders → RPM
 
 Suponiendo:
 
-- `CPR`: cuentas por revolución por canal (puede multiplicarse por 4 si se usan flancos de A y B).
-- \( \Delta N_L, \Delta N_R \): incremento de cuenta en un período \(\Delta t\).
+- `CPR`: cuentas por revolución por canal.
+- \( \Delta N_L, \Delta N_R \): incremento de cuenta en un período \( \Delta t \).
 
-La RPM de cada rueda se aproxima como:
+RPM de cada rueda:
 
-\[
-\text{RPM}_L = \frac{\Delta N_L}{\text{CPR}} \cdot \frac{60}{\Delta t}
-\]
+- \( \text{RPM}_L = \dfrac{\Delta N_L}{\text{CPR}} \cdot \dfrac{60}{\Delta t} \)
+- \( \text{RPM}_R = \dfrac{\Delta N_R}{\text{CPR}} \cdot \dfrac{60}{\Delta t} \)
 
-\[
-\text{RPM}_R = \frac{\Delta N_R}{\text{CPR}} \cdot \frac{60}{\Delta t}
-\]
+Velocidad media:
 
-La velocidad media:
+- \( v = \dfrac{\text{RPM}_L + \text{RPM}_R}{2} \)
 
-\[
-v = \frac{\text{RPM}_L + \text{RPM}_R}{2}
-\]
+Filtro IIR (pasa‑bajas) para las RPM:
 
-Tu código aplica además un **filtro IIR** (pasa-bajas) a las RPM:
+- \( \text{RPM}_{\text{filtrada}}(k) = \alpha \cdot \text{RPM}_{\text{filtrada}}(k-1) + (1 - \alpha) \cdot \text{RPM}_{\text{medida}}(k) \)
 
-\[
-\text{RPM}_{\text{filtrada}}(k) = \alpha \cdot \text{RPM}_{\text{filtrada}}(k-1) + (1 - \alpha) \cdot \text{RPM}_{\text{medida}}(k)
-\]
-
-con \( \alpha \) cercano a 1 para suavizar.
+con \( \alpha \) cercano a 1.
 
 ---
 
@@ -120,90 +111,70 @@ con \( \alpha \) cercano a 1 para suavizar.
 
 ### 4.1. Ángulo por acelerómetro
 
-El acelerómetro entrega \(a_x, a_y, a_z\) en unidades de \(g\) (tras aplicar factores de escala). El ángulo de inclinación (por ejemplo pitch) se puede aproximar como:
+Con \( a_x, a_y, a_z \) en unidades de \( g \):
 
-\[
-\theta_{\text{acc}} = \arctan2(a_x, a_z)
-\]
+- \( \theta_{\text{acc}} = \arctan2(a_x, a_z) \)
 
-o alguna variante según el eje elegido.
-
-Este ángulo es bueno a baja frecuencia (baja dinámica), pero ruidoso.
+Es una medida buena a baja frecuencia, pero ruidosa.
 
 ### 4.2. Ángulo por giroscopio
 
-El giroscopio entrega la velocidad angular \(\omega\) (por ejemplo en grados/s). Integrando en el tiempo:
+El giroscopio entrega velocidad angular \( \omega \) (por ejemplo grados/s). Integrando:
 
-\[
-\theta_{\text{gyro}}(k) = \theta_{\text{gyro}}(k-1) + \omega(k) \cdot \Delta t
-\]
+- \( \theta_{\text{gyro}}(k) = \theta_{\text{gyro}}(k-1) + \omega(k) \cdot \Delta t \)
 
-Este ángulo es bueno a alta frecuencia, pero sufre **deriva** con el tiempo.
+Buena a alta frecuencia, pero con deriva.
 
 ### 4.3. Filtro complementario
 
-El filtro complementario combina ambas estimaciones:
+Combinación de ambas:
 
-\[
-\theta_{\text{filt}}(k) = \alpha \left[ \theta_{\text{filt}}(k-1) + \omega(k) \cdot \Delta t \right] + (1 - \alpha)\, \theta_{\text{acc}}(k)
-\]
+- \( \theta_{\text{filt}}(k) = \alpha \left[ \theta_{\text{filt}}(k-1) + \omega(k) \cdot \Delta t \right] + (1 - \alpha)\, \theta_{\text{acc}}(k) \)
 
-- \( \alpha \in (0,1) \) (típicamente entre 0.90 y 0.99). [web:99][web:102]
-- Alto peso a la integración del giroscopio (respuesta rápida).
-- Bajo peso al ángulo del acelerómetro (corrige deriva en el largo plazo).
-
-En tu módulo `mpu_block`, esta lógica se implementa dentro de la función que actualiza `angleFiltered`, usando el tiempo entre lecturas como \(\Delta t\).
+Con \( \alpha \in (0,1) \), usualmente entre 0.90 y 0.99.
 
 ---
 
 ## 5. Control en cascada ⚙️
 
-El controlador principal está organizado en **dos lazos**:
+Dos lazos:
 
-1. **Lazo de ángulo** (externo):  
-   - Variable medida: `angleFiltered`.
-   - Referencia: \( \theta_{\text{ref}} = 0 \) (robot vertical).
-   - Salida: referencia de velocidad o término “corrección” para la velocidad.
+1. **Lazo de ángulo (externo)**  
+   - Medida: `angleFiltered`.  
+   - Referencia: \( \theta_{\text{ref}} = 0 \) (vertical).  
+   - Salida: referencia de velocidad o corrección.
 
-2. **Lazo de velocidad** (interno):  
-   - Variable medida: velocidad (RPM media de las ruedas).
-   - Referencia: salida del lazo de ángulo (y posiblemente otros términos).
+2. **Lazo de velocidad (interno)**  
+   - Medida: velocidad (RPM media).  
+   - Referencia: salida del lazo de ángulo.  
    - Salida: PWM base que va a los motores.
 
 ### 5.1. PID de ángulo
 
-Error de ángulo:
+Error:
 
-\[
-e_\theta(k) = \theta_{\text{ref}}(k) - \theta_{\text{filt}}(k)
-\]
+- \( e_\theta(k) = \theta_{\text{ref}}(k) - \theta_{\text{filt}}(k) \)
 
-Controlador PID:
+PID:
 
-\[
-u_\theta(k) = K_p^\theta \, e_\theta(k) + K_i^\theta \sum_{i=0}^{k} e_\theta(i)\Delta t + K_d^\theta \frac{e_\theta(k) - e_\theta(k-1)}{\Delta t}
-\]
+- \( u_\theta(k) = K_p^\theta e_\theta(k) + K_i^\theta \sum_{i=0}^{k} e_\theta(i)\Delta t + K_d^\theta \dfrac{e_\theta(k) - e_\theta(k-1)}{\Delta t} \)
 
 En tu sistema:
 
-- \( K_p^\theta \) no es fijo: la **red neuronal** proporciona un factor para adaptarlo.
-- El resultado se convierte en una referencia de velocidad o directamente en un aporte al PWM interno.
+- \( K_p^\theta \) es ajustado por la red neuronal.
+- El resultado se usa como referencia de velocidad o aporte al PWM interno.
 
 ### 5.2. PI de velocidad
 
-Error de velocidad:
+Error:
 
-\[
-e_v(k) = v_{\text{ref}}(k) - v(k)
-\]
+- \( e_v(k) = v_{\text{ref}}(k) - v(k) \)
 
-Controlador PI:
+PI:
 
-\[
-u_v(k) = K_p^v \, e_v(k) + K_i^v \sum_{i=0}^{k} e_v(i)\Delta t
-\]
+- \( u_v(k) = K_p^v e_v(k) + K_i^v \sum_{i=0}^{k} e_v(i)\Delta t \)
 
-`u_v` es el **PWM base** (antes de aplicar el factor de giro del seguidor de línea). Luego se saturará a \([-PWM_{\max}, PWM_{\max}]\).
+`u_v` es el PWM base (antes de aplicar el factor de giro) y luego se satura a \([-PWM_{\max}, PWM_{\max}]\).
 
 ---
 
@@ -211,77 +182,55 @@ u_v(k) = K_p^v \, e_v(k) + K_i^v \sum_{i=0}^{k} e_v(i)\Delta t
 
 ### 6.1. Estructura general
 
-La RN implementada es un **perceptrón multicapa feed-forward**:
+La RN es un perceptrón multicapa feed‑forward:
 
-\[
-\text{Input} \rightarrow \text{Hidden layers} \rightarrow \text{Output}
-\]
+- \( \text{Input} \rightarrow \text{Hidden layers} \rightarrow \text{Output} \)
 
-En tu caso (según el módulo `nn_cascade_block`):
+Entradas típicas:
 
-- Entrada: vector que incluye, por ejemplo:
-  - Error de ángulo \( e_\theta \).
-  - Error de velocidad \( e_v \).
-  - Derivadas o valores previos (según cómo se definieron las características).
-- Capas ocultas: al menos 1 capa con neuronas tipo **logsig** (sigmoide logística saturada).
-- Salida: una variable escalar que modula \( K_p^\theta \) (o directamente un factor multiplicativo sobre la salida del PID).
+- Error de ángulo \( e_\theta \).
+- Error de velocidad \( e_v \).
+- Quizá derivadas o valores previos.
 
-La salida de la RN se puede escribir como:
+Capas ocultas:
 
-\[
-y = f_{\text{out}}\left( W^{(L)} \cdot f_{L-1} \left( \dots f_1\left( W^{(1)} x + b^{(1)} \right) \dots \right) + b^{(L)} \right)
-\]
+- Neuronas con activación `logsig` (sigmoide logística).
 
-donde:
+Salida:
 
-- \(x\): vector de entrada.
-- \(W^{(l)}, b^{(l)}\): pesos y biases de la capa \(l\).
-- \(f_l(\cdot)\): función de activación (por ejemplo **logsig**).
-- \(y\): salida escalar usada para modificar el controlador.
+- Escalar que modula \( K_p^\theta \) o actúa como factor multiplicativo.
+
+Salida general:
+
+- \( y = f_{\text{out}}\left( W^{(L)} f_{L-1}(\dots f_1( W^{(1)} x + b^{(1)} ) \dots ) + b^{(L)} \right) \)
 
 ### 6.2. Funciones de activación
 
-Has configurado la RN con strings como `"logsig"` y `"poslin_lim"`:
+- `logsig` (sigmoide logística):  
+  - \( \text{logsig}(z) = \dfrac{1}{1 + e^{-z}} \)
 
-- `logsig`: sigmoide logística
+- `poslin_lim` (posible lineal positiva limitada):  
+  - \( \text{poslin\_lim}(z) = 0 \) si \( z < 0 \)  
+  - \( \text{poslin\_lim}(z) = z \) si \( 0 \le z \le z_{\max} \)  
+  - \( \text{poslin\_lim}(z) = z_{\max} \) si \( z > z_{\max} \)
 
-\[
-\text{logsig}(z) = \frac{1}{1 + e^{-z}}
-\]
+La combinación da salidas suaves y acotadas.
 
-- `poslin_lim`: posiblemente una versión limitada de ReLU o “positiva lineal limitada”, por ejemplo:
+### 6.3. Rol en el control
 
-\[
-\text{poslin\_lim}(z) =
-\begin{cases}
-0, & z < 0 \\
-z, & 0 \le z \le z_{\max} \\
-z_{\max}, & z > z_{\max}
-\end{cases}
-\]
+Idea:
 
-La combinación de estas funciones da un comportamiento **suave** y al mismo tiempo **acotado** para la salida, evitando que los ajustes de \(K_p^\theta\) sean extremos.
+1. El PID clásico genera un comportamiento base.
+2. La RN observa errores y estados.
+3. Genera un ajuste de \( K_p^\theta \):
 
-### 6.3. Rol de la RN en el control
+   - \( K_{p,\text{ef}}^\theta = K_{p,\text{base}}^\theta + \Delta K_p^\theta \)  
+     o  
+   - \( K_{p,\text{ef}}^\theta = K_{p,\text{base}}^\theta \cdot (1 + y) \)
 
-La idea es:
+4. Esto compensa cambios de masa, fricción, montaje, etc.
 
-1. El sistema (PID clásico) genera un comportamiento base de balanceo.
-2. La RN observa **errores** y/o variables de estado.
-3. La RN genera un factor \( \Delta K_p^\theta \) o un factor multiplicativo:
-
-\[
-K_{p,\text{ef}}^\theta = K_{p,\text{base}}^\theta + \Delta K_p^\theta
-\quad \text{o} \quad
-K_{p,\text{ef}}^\theta = K_{p,\text{base}}^\theta \cdot (1 + y)
-\]
-
-4. Esto permite adaptarse a cambios en:
-   - Masa del robot (batería, carga).
-   - Coeficientes de fricción.
-   - Pequeñas variaciones en el montaje mecánico.
-
-En tu código, la lógica de actualización se encapsula en `cascada(...)`: la RN se evalúa cada ciclo, y la salida se usa para actualizar internamente la acción de control.
+La evaluación y aplicación se hace dentro de `cascada(...)` en cada ciclo de control.
 
 ---
 
@@ -289,188 +238,133 @@ En tu código, la lógica de actualización se encapsula en `cascada(...)`: la R
 
 ### 7.1. Sensores y codificación
 
-- 8 sensores digitales (por ejemplo \(S_0, \dots, S_7\)), cada uno devuelve `0` (negro) o `1` (blanco).
-- La posición de la línea se calcula asignando un peso a cada sensor:
+- 8 sensores digitales \( S_0, \dots, S_7 \), cada uno vale 0 (negro) o 1 (blanco).
+- Posición de la línea:
 
-\[
-\text{pos} = \frac{\sum_{i=0}^{7} w_i \cdot s_i}{\sum_{i=0}^{7} s_i}
-\]
+  - \( \text{pos} = \dfrac{\sum_{i=0}^{7} w_i s_i}{\sum_{i=0}^{7} s_i} \)
 
-donde:
+  donde:
 
-- \(w_i\) son posiciones nominales (0, 100, 200, …, 700).
-- \(s_i\) son 0/1 (o invertidos según hardware).
+  - \( w_i \) son las posiciones 0, 100, 200, …, 700.
+  - \( s_i \) son 0/1.
 
-El rango suele ser 0–700 y el centro (línea bajo el centro del robot) se ubica cerca de 350.
+Rango típico: 0–700, centro ≈ 350.
 
 ### 7.2. PID de línea
 
-Se define un error de línea:
+Error de línea:
 
-\[
-e_{\text{line}}(k) = \text{pos}_{\text{ref}} - \text{pos}(k)
-\]
-
-Normalmente \(\text{pos}_{\text{ref}} = 350\) ó el valor que corresponda al centro.
+- \( e_{\text{line}}(k) = \text{pos}_{\text{ref}} - \text{pos}(k) \)
 
 PID:
 
-\[
-u_{\text{line}}(k) = K_p^{\text{line}} e_{\text{line}}(k) + K_i^{\text{line}} \sum e_{\text{line}}(i)\Delta t + K_d^{\text{line}} \frac{e_{\text{line}}(k) - e_{\text{line}}(k-1)}{\Delta t}
-\]
+- \( u_{\text{line}}(k) = K_p^{\text{line}} e_{\text{line}}(k) + K_i^{\text{line}} \sum e_{\text{line}}(i)\Delta t + K_d^{\text{line}} \dfrac{e_{\text{line}}(k) - e_{\text{line}}(k-1)}{\Delta t} \)
 
-Luego se escala y se satura para generar `factor_giro`:
+Se escala para obtener `factor_giro`:
 
-\[
-\text{factor\_giro} = \text{sat}\left( \frac{u_{\text{line}}}{\text{escala}} \right), \quad \text{con } \text{sat}(\cdot) \in [-f_{\max}, f_{\max}]
-\]
+- \( \text{factor\_giro} = \text{sat}\left( \dfrac{u_{\text{line}}}{\text{escala}} \right) \), con \(\text{sat}(\cdot) \in [-f_{\max}, f_{\max}]\).
 
-### 7.3. Aplicación al PWM de motores
+### 7.3. Aplicación al PWM
 
-Si `pwmBase` es el PWM salido del cascada (balanceo), entonces:
+Si `pwmBase` es el PWM del cascada:
 
-\[
-pwm_L = pwmBase \cdot (1 + \text{factor\_giro})
-\]
+- \( pwm_L = pwmBase \cdot (1 + \text{factor\_giro}) \)
+- \( pwm_R = pwmBase \cdot (1 - \text{factor\_giro}) \)
 
-\[
-pwm_R = pwmBase \cdot (1 - \text{factor\_giro})
-\]
-
-- Si `factor_giro > 0`: la rueda izquierda acelera y la derecha frena → giro a la derecha.
-- Si `factor_giro < 0`: al revés → giro a la izquierda.
-
-De esta forma, el **balanceo** se mantiene y el robot corrige su dirección para seguir la línea.
+- `factor_giro > 0`: rueda izquierda acelera, derecha frena → giro a la derecha.
+- `factor_giro < 0`: al revés → giro a la izquierda.
 
 ---
 
-## 8. Tareas FreeRTOS y flujo de ejecución 🧵⏱️
+## 8. Tareas FreeRTOS y flujo 🧵⏱️
 
 ### 8.1. TaskBalanceo
 
-Período típico: ~20 ms (50 Hz), usando `vTaskDelay` o `xTaskDelayUntil`.
+Período típico: 20 ms (50 Hz).
 
 Pseudoflujo:
 
-1. Medir tiempo \(\Delta t\).
+1. Medir \( \Delta t \).
 2. Leer MPU6050 (acc + gyro).
-3. Actualizar `angleFiltered` mediante el filtro complementario.
+3. Actualizar `angleFiltered` con el filtro complementario.
 4. Leer y resetear contadores de encoders.
 5. Calcular RPM y aplicar filtro IIR.
 6. Llamar a `cascada(angleFiltered, rpmL_f, rpmR_f, dt)`:
-   - Actualiza errores.
-   - Ejecuta RN para ajustar parámetros.
-   - Calcula PWM base saturado.
-7. Combinar con `factor_giro`:
-   - `pwmL`, `pwmR`.
-8. Llamar a `driveMotorsDifferential(pwmL, pwmR)`.
+   - Actualizar errores.
+   - Ejecutar RN.
+   - Calcular PWM base saturado.
+7. Combinar con `factor_giro` → `pwmL`, `pwmR`.
+8. `driveMotorsDifferential(pwmL, pwmR)`.
 
 ### 8.2. TaskLinea
 
-Período típico: ~100 ms (10 Hz).
+Período típico: 100 ms (10 Hz).
 
 Pseudoflujo:
 
-1. Leer los 8 sensores de línea.
+1. Leer los 8 sensores.
 2. Calcular posición de la línea.
-3. Calcular error de línea.
+3. Calcular error.
 4. Ejecutar PID de línea.
-5. Actualizar `factor_giro` (global, protegida si hace falta).
+5. Actualizar `factor_giro`.
 
-### 8.3. Calibración de MPU (botón)
+### 8.3. Calibración de MPU
 
-En `loop` o en una tarea auxiliar:
-
-1. Detectar pulsación del botón `BTN_CAL`.
-2. Llamar a `stopRobotAndTasks()`:
-   - Poner PWM a 0.
+1. Detectar pulsación de `BTN_CAL`.
+2. `stopRobotAndTasks()`:
+   - PWM = 0.
    - Suspender tareas de balanceo y línea.
-3. Llamar a `calibrateMPU()`:
-   - Tomar `N` muestras.
-   - Calcular offsets promedio.
-   - Ajustar `ax_offset`, `ay_offset`, `az_offset`, `gx_offset`.
-   - Guardar en `Preferences`.
+3. `calibrateMPU()`:
+   - Tomar N muestras.
+   - Calcular offsets.
+   - Guardar en NVS.
 4. Recalcular ángulo inicial.
-5. Llamar a `resumeRobotAndTasks()`.
+5. `resumeRobotAndTasks()`.
 
 ---
 
 ## 9. Flujo de trabajo del desarrollador 👨‍💻
 
-### 9.1. Git y versionado
-
 - Rama principal: `main`.
-- Flujo típico:
+
+Flujo típico:
 
 ```
-# Ver estado
 git status
-
-# Añadir cambios
 git add .
-
-# Commit
 git commit -m "Descripción del cambio"
-
-# Subir a GitHub
 git push
 ```
 
-- En caso de cambios remotos:
+En caso de cambios remotos:
 
 ```
 git pull
 ```
 
-### 9.2. Compilación y carga (PlatformIO)
+Compilación y carga con PlatformIO:
 
 ```
-pio run -t upload           # Compilar y subir firmware
-pio device monitor -b 115200  # Monitor serie
+pio run -t upload
+pio device monitor -b 115200
 ```
 
 ---
 
-## 10. Ideas de mejora / extensiones 🌱
+## 10. Ideas de mejora 🌱
 
-- Añadir un **modo de solo balanceo** (sin seguidor de línea) seleccionable por botón.
-- Implementar una **interfaz serie o web** para ajustar parámetros PID y de la RN en tiempo real.
-- Registrar datos de telemetría (ángulo, RPM, salida RN) para análisis offline.
-- Explorar otras técnicas de IA:
-  - Redes recurrentes (RNN/LSTM) para ver si mejoran la anticipación de caídas.
-  - Control por **reinforcement learning** para swing-up + balanceo. [web:110][web:116]
+- Modo de solo balanceo (sin seguidor de línea).
+- Interfaz serie/web para ajustar parámetros PID y de la RN en tiempo real.
+- Registro de telemetría para análisis offline.
+- Experimentar con RNN o reinforcement learning para swing‑up + balanceo.
 
 ---
 
 ## 11. Resumen conceptual 🧠
 
 - El robot es un **péndulo invertido sobre ruedas**.
-- El lazo de ángulo trata de “mantener la vara vertical”.
-- El lazo de velocidad traduce esa corrección en movimiento de las ruedas.
-- La **red neuronal** ajusta parámetros del controlador para adaptarlo a cambios en el sistema.
-- El **PID de línea** desvía ligeramente el par de motores para seguir una línea sin romper el equilibrio.
-- FreeRTOS permite separar la lógica de **balanceo rápido** de la lógica de **seguimiento de línea más lenta**.
-
----
-```
-
-[1](https://forum.arduino.cc/t/mpu6050-complementary-filter/315523)
-[2](https://forum.arduino.cc/t/mpu6050-with-arduino-complementary-filter/388384)
-[3](https://www.reddit.com/r/arduino/comments/5syouj/mpu6050_complementary_filter/)
-[4](https://www.hibit.dev/posts/92/complementary-filter-and-relative-orientation-with-mpu6050)
-[5](https://www.youtube.com/watch?v=OTuk-GdoPUQ)
-[6](https://onlinelibrary.wiley.com/doi/10.1155/2021/5536573)
-[7](https://www.reddit.com/r/esp32/comments/1m5ks86/freertos_help_managing_multiple_tasks_for_stepper/)
-[8](https://worldscientificnews.com/wp-content/uploads/2025/01/WSN-199-2025-218-234.pdf)
-[9](https://jte.edu.vn/index.php/jte/article/view/657)
-[10](https://www.teachmemicro.com/multitask-with-esp32-and-freertos/)
-[11](https://toptechboy.com/improving-accuracy-of-mpu6050-data-using-a-complimentary-filter/)
-[12](https://journals.plos.org/plosone/article/file?id=10.1371%2Fjournal.pone.0280071&type=printable)
-[13](https://randomnerdtutorials.com/esp32-freertos-arduino-tasks/)
-[14](https://ijeee.edu.iq/Papers/Vol15-Issue2/172878.pdf)
-[15](https://www.academia.edu/26878388/Artificial_Neural_Network_identification_and_control_of_the_inverted_pendulum)
-[16](https://controllerstech.com/esp32-freertos-task-control-guide/)
-[17](http://journalarticle.ukm.my/20600/1/24.pdf)
-[18](https://www.arxiv.org/pdf/2502.00248.pdf)
-[19](https://www.youtube.com/watch?v=V-RGB5yem-Q)
-[20](https://www.youtube.com/watch?v=qmd6CVrlHOM)
+- El lazo de ángulo mantiene la “vara” vertical.
+- El lazo de velocidad traduce esa corrección en movimiento de ruedas.
+- La red neuronal ajusta parámetros del controlador para adaptarse a cambios.
+- El PID de línea corrige suavemente la trayectoria sin romper el equilibrio.
+- FreeRTOS separa la lógica de balanceo rápido del seguimiento de línea más lento.
